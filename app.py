@@ -7,6 +7,8 @@ import traceback
 import streamlit as st
 from collections.abc import Mapping
 from langchain_core.documents import Document
+import pandas as pd
+# Ensure you have installed it: pip install pandas
 
 def _show_startup_error(exc: Exception):
     try:
@@ -30,24 +32,13 @@ def main():
 
     try:
         import pandas as pd  # local import so app can still start if pandas fails
-        st.write("pandas:", pd.__version__)
         PANDAS_AVAILABLE = True
     except Exception as e:
         pd = None  # type: ignore
         PANDAS_AVAILABLE = False
         st.warning(f"pandas import failed: {e}")
-        try:
-            st.error(
-                "Pandas failed to import (likely numpy/pandas binary mismatch). "
-                "Tabular (CSV/Excel) support is disabled. To enable, reinstall/upgrade numpy and pandas, for example:\n\n"
-                "pip install --upgrade numpy pandas\n\n"
-                f"Import error: {e}"
-            )
-        except Exception:
-            pass
-
-    st.success("Minimal debug UI rendered — environment OK")
-    st.write("Now revert to app.py and run streamlit run app.py to capture actual app errors.")
+        st.error("Cannot process structured data without pandas. Please install pandas.")
+        return
 
     # Optional libs (safe imports)
     pdfplumber = None
@@ -319,7 +310,7 @@ def main():
         placeholder="Hospital: 'Female patients above 60 with stroke' | Manufacturing: 'Parts with failure rate above 5% in Plant B' | Sales: 'Top 10 customers by revenue last quarter'"
     )
 
-    # Process query with hybrid SQL + Vector filtering
+    # Process query with Robust LangChain Agent
     if query and df is not None:
         st.subheader("🔍 Query Results")
         
@@ -328,50 +319,19 @@ def main():
             schema_key = f"schema_{uploaded_file.name}" if uploaded_file is not None else "schema_in_memory"
             schema = session.get(schema_key, {})
             
-            # Hybrid Search: Try SQL first, then Vector for semantic understanding
-            if conn:
-                filtered_df = apply_sql_filter(conn, table_name, query, schema)
-                st.success("🔧 Used SQL filtering for precise results")
-            else:
-                filtered_df = apply_intelligent_filter(df, query, schema)
-                st.info("📊 Used pandas filtering")
+            # STEP 1: Create enhanced system prompt with dynamic schema
+            system_prompt = create_enhanced_system_prompt(df, schema)
             
-            # Optional: Add vector search for semantic similarity if available
-            if vectorstore and len(filtered_df) > 0:
-                st.subheader("🧠 Semantic Similarity Results")
-                try:
-                    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-                    semantic_results = retriever.invoke(query)
-                    
-                    if semantic_results:
-                        st.write("Semantically similar records:")
-                        for i, doc in enumerate(semantic_results, 1):
-                            st.markdown(f"**Result {i}**")
-                            st.write(doc.page_content)
-                            st.write("---")
-                except Exception as e:
-                    st.warning(f"Semantic search failed: {e}")
+            # STEP 2: Initialize LangChain Pandas Agent with proper imports
+            agent = create_robust_langchain_agent(df, system_prompt)
             
-            # STEP 9: Reasoning & Follow-up Questions
-            if vectorstore and is_reasoning_query(query):
-                st.subheader("🤖 AI Reasoning & Analysis")
-                try:
-                    reasoning_result = apply_llm_reasoning(filtered_df, query, semantic_results if 'semantic_results' in locals() else None)
-                    st.write(reasoning_result)
-                    
-                    # Suggest follow-up questions
-                    st.subheader("💡 Suggested Follow-up Questions")
-                    followups = generate_followup_questions(query, filtered_df, schema)
-                    for i, followup in enumerate(followups, 1):
-                        st.write(f"{i}. {followup}")
-                        
-                except Exception as e:
-                    st.warning(f"AI reasoning failed: {e}")
-                    st.info("This feature requires LLM integration for advanced reasoning.")
+            # STEP 3: Execute query with comprehensive error handling
+            result = execute_robust_agent_query(agent, query, df)
             
-            # Display main filtered results
-            if len(filtered_df) > 0:
-                st.success(f"Found {len(filtered_df)} matching records")
+            if result["success"]:
+                filtered_df = result["data"]
+                st.success(f"🤖 Agent processed query successfully")
+                st.write(f"📊 Found {len(filtered_df)} matching records")
                 st.dataframe(filtered_df)
                 
                 # Show summary statistics
@@ -379,137 +339,793 @@ def main():
                 for col in filtered_df.select_dtypes(include=['number']).columns:
                     st.write(f"**{col}:** Min={filtered_df[col].min():.2f}, Max={filtered_df[col].max():.2f}, Avg={filtered_df[col].mean():.2f}")
             else:
-                st.info("No records found matching your query")
+                st.error(f"❌ Agent failed: {result['error']}")
+                st.info("🔄 Attempting fallback filtering...")
+                
+                # Fallback to manual filtering
+                fallback_df = apply_manual_fallback_filtering(df, query, schema)
+                if len(fallback_df) < len(df):
+                    st.success("✅ Fallback filtering successful")
+                    st.dataframe(fallback_df)
+                else:
+                    st.warning("⚠️ Both agent and fallback failed. Please check your query syntax.")
                 
         except Exception as e:
-            st.error(f"Error processing query: {e}")
-            st.info("Try simpler queries like: 'show all', 'filter by column_name', 'column_name > value'")
+            st.error(f"❌ Critical error in query processing: {str(e)}")
+            st.error("Please check your query syntax and try again.")
+            st.info("💡 Tip: Use exact column names and clear conditions (e.g., 'Age > 60', 'Gender = Female')")
+
+def create_robust_langchain_agent(df, system_prompt):
+    """Create LangChain agent with proper import handling and context"""
+    try:
+        # Try to import LangChain with OpenAI
+        from langchain_experimental.agents import create_pandas_dataframe_agent
+        from langchain_openai import ChatOpenAI
+        
+        # Check for API key
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            st.warning("⚠️ OpenAI API key not found. Using custom agent.")
+            return create_custom_pandas_agent(df, system_prompt)
+        
+        # Create LLM
+        llm = ChatOpenAI(
+            model="gpt-4o-mini",  # Cost-effective and fast
+            temperature=0,
+            api_key=api_key
+        )
+        
+        # Create agent with enhanced configuration
+        agent = create_pandas_dataframe_agent(
+            df,
+            llm=llm,
+            verbose=True,
+            allow_dangerous_code=True,
+            max_iterations=3,
+            max_execution_time=30,
+            early_stopping_method="generate",
+            handle_parsing_errors=True,
+            system_prompt=system_prompt,
+            prefix="""You are working with a dataframe named `df`. pandas is imported as pd. """
+        )
+        
+        return agent
+        
+    except ImportError as e:
+        st.warning(f"⚠️ LangChain not available: {e}. Using custom agent.")
+        return create_custom_pandas_agent(df, system_prompt)
+    except Exception as e:
+        st.error(f"❌ Failed to create agent: {e}")
+        return create_custom_pandas_agent(df, system_prompt)
+
+def execute_robust_agent_query(agent, query, df):
+    """Execute agent query with proper context and error handling"""
+    try:
+        # Create execution context with required libraries
+        execution_context = {
+            'pd': pd,  # Critical: Pass pandas library
+            'df': df,
+            'np': __import__('numpy'),  # Import numpy if available
+            'datetime': __import__('datetime')  # Import datetime if needed
+        }
+        
+        # Execute the query
+        result = agent.run(query)
+        
+        # Validate the result
+        if isinstance(result, pd.DataFrame):
+            return {"success": True, "data": result, "query": query}
+        elif hasattr(result, '__iter__'):
+            try:
+                # Convert to DataFrame if possible
+                # Fix: Wrap result in list to handle scalar dictionary error
+                if isinstance(result, dict):
+                    result_df = pd.DataFrame([result]) if not isinstance(result, pd.DataFrame) else result
+                else:
+                    result_df = pd.DataFrame(result) if not isinstance(result, pd.DataFrame) else result
+                return {"success": True, "data": result_df, "query": query}
+            except Exception as e:
+                return {"success": False, "error": f"Result conversion failed: {str(e)}", "query": query}
+        else:
+            return {"success": False, "error": "Agent returned invalid data format", "query": query}
+                
+    except Exception as e:
+        return {"success": False, "error": f"Agent execution failed: {str(e)}", "query": query}
+
+def create_enhanced_system_prompt(df, schema):
+    """Create enhanced system prompt with categorical value awareness"""
+    columns_info = []
+    categorical_values = {}
+    
+    for col in df.columns:
+        dtype = str(df[col].dtype)
+        columns_info.append(f"  - {col} ({dtype})")
+        
+        # Extract unique values for categorical columns
+        if 'object' in dtype or df[col].dtype == 'object':
+            unique_vals = df[col].dropna().unique().tolist()
+            if len(unique_vals) <= 10:  # Only show if manageable
+                categorical_values[col] = unique_vals
+    
+    columns_list = ", ".join(df.columns.tolist())
+    
+    # Build categorical values section
+    cat_values_section = ""
+    if categorical_values:
+        cat_values_section = "\nCategorical Values (for exact matching):\n"
+        for col, values in categorical_values.items():
+            cat_values_section += f"  - {col}: {', '.join(map(str, values[:5]))}\n"
+    
+    system_prompt = f"""You are a data analyst assistant with access to a pandas DataFrame.
+
+**Table Structure:**
+Table Name: df
+Columns:
+{chr(10).join(columns_info)}
+
+Available columns: {columns_list}
+
+**Data Types:**
+- Numeric columns (int, float): Use mathematical operators (>, <, >=, <=, ==)
+- Categorical columns (object): Use exact string matching or .contains()
+
+{cat_values_section}
+
+**Instructions:**
+1. Use ONLY the column names listed above - do not guess or hallucinate column names
+2. For numeric comparisons: "above 60" means > 60, "below 30" means < 30
+3. For categorical matching: Use exact values from the list above, or .contains() for partial matches
+4. Handle user typos with partial matching (e.g., 'femal' should match 'Female')
+5. Return executable pandas code that filters the DataFrame
+
+**Examples:**
+- Age > 60: df[df['Age'] > 60]
+- Gender = Female: df[df['Gender'] == 'Female']
+- Department contains Sales: df[df['Department'].str.contains('Sales', case=False)]
+- Top 10 by Salary: df.nlargest(10, 'Salary')
+
+**Error Handling:**
+- If column doesn't exist, return an error message
+- If data type doesn't support operation, return an error message
+- Always return valid pandas DataFrame operations
+
+Execute the user's query and return the filtered DataFrame."""
+    return system_prompt
+
+def create_langchain_pandas_agent(df, system_prompt):
+    """Create LangChain Pandas Dataframe Agent with proper configuration"""
+    try:
+        from langchain_experimental.agents import create_pandas_dataframe_agent
+        from langchain.llms import OpenAI
+        
+        # Create agent with our system prompt
+        agent = create_pandas_dataframe_agent(
+            df,
+            verbose=True,
+            allow_dangerous_code=True,
+            max_iterations=3,
+            max_execution_time=30,
+            early_stopping_method="generate",
+            handle_parsing_errors=True,
+            system_prompt=system_prompt
+        )
+        
+        return agent
+        
+    except ImportError:
+        st.warning("⚠️ LangChain not available. Using custom agent implementation.")
+        return create_custom_pandas_agent(df, system_prompt)
+    except Exception as e:
+        st.error(f"❌ Failed to create agent: {e}")
+        return create_custom_pandas_agent(df, system_prompt)
+
+def create_custom_pandas_agent(df, system_prompt):
+    """Custom agent implementation when LangChain is not available"""
+    class CustomPandasAgent:
+        def __init__(self, df, system_prompt):
+            self.df = df
+            self.system_prompt = system_prompt
+            self.columns = df.columns.tolist()
+            self.dtypes = {col: str(dtype) for col, dtype in df.dtypes.items()}
+        
+        def run(self, query):
+            try:
+                # Simple but robust query parsing
+                filtered_df = self.df.copy()
+                query_lower = query.lower()
+                
+                for col in self.columns:
+                    if col.lower() in query_lower:
+                        dtype = self.dtypes[col]
+                        
+                        if 'int' in dtype or 'float' in dtype:
+                            # Numeric operations
+                            if '>' in query or 'above' in query_lower or 'greater than' in query_lower:
+                                match = re.search(rf'{col.lower()}\s*(?:>|above|greater than|over)\s*([\d.]+)', query_lower)
+                                if match:
+                                    value = float(match.group(1))
+                                    filtered_df = filtered_df[filtered_df[col] > value]
+                            
+                            elif '<' in query or 'below' in query_lower or 'less than' in query_lower:
+                                match = re.search(rf'{col.lower()}\s*(?:<|below|less than|under)\s*([\d.]+)', query_lower)
+                                if match:
+                                    value = float(match.group(1))
+                                    filtered_df = filtered_df[filtered_df[col] < value]
+                        
+                        elif 'object' in dtype:
+                            # String operations with typo tolerance
+                            if 'female' in query_lower and 'gender' in col.lower():
+                                filtered_df = filtered_df[filtered_df[col].str.contains('female', case=False, na=False)]
+                            elif 'male' in query_lower and 'gender' in col.lower():
+                                filtered_df = filtered_df[filtered_df[col].str.contains('male', case=False, na=False)]
+                
+                return safe_dataframe_conversion(filtered_df)
+                
+            except Exception as e:
+                return safe_dataframe_conversion({"error": str(e), "query": query})
+    
+    return CustomPandasAgent(df, system_prompt)
+
+def safe_dataframe_conversion(data):
+    """
+    Helper to prevent 'scalar values' error when creating DataFrames
+    """
+    try:
+        # Case 1: Data is already a DataFrame
+        if isinstance(data, pd.DataFrame):
+            return data
+            
+        # Case 2: Data is a list of dicts (Standard)
+        if isinstance(data, list):
+            return pd.DataFrame(data)
+            
+        # Case 3: Data is a single dict (The cause of your error!)
+        if isinstance(data, dict):
+            # We must wrap it in brackets []
+            return pd.DataFrame([data]) 
+            
+        # Case 4: Data is a simple string/number (e.g., count)
+        return pd.DataFrame({"Result": [data]})
+        
+    except Exception as e:
+        return pd.DataFrame({"Error": [f"Conversion failed: {str(e)}"]})
+
+def execute_agent_query(agent, query, df):
+    """Execute agent query with comprehensive error handling"""
+    try:
+        # Execute the query
+        result = agent.run(query)
+        
+        # Validate the result
+        if isinstance(result, pd.DataFrame):
+            return {"success": True, "data": result, "query": query}
+        else:
+            # Try to extract DataFrame from result
+            if hasattr(result, '__iter__'):
+                try:
+                    # Convert to DataFrame if possible
+                    # Fix: Wrap result in list to handle scalar dictionary error
+                    if isinstance(result, dict):
+                        result_df = pd.DataFrame([result]) if not isinstance(result, pd.DataFrame) else result
+                    else:
+                        result_df = pd.DataFrame(result) if not isinstance(result, pd.DataFrame) else result
+                    return {"success": True, "data": result_df, "query": query}
+                except:
+                    return {"success": False, "error": "Agent returned invalid data format", "query": query}
+            else:
+                return {"success": False, "error": "Agent returned non-DataFrame result", "query": query}
+                
+    except Exception as e:
+        return {"success": False, "error": f"Agent execution failed: {str(e)}", "query": query}
+
+def apply_manual_fallback_filtering(df, query, schema):
+    """Manual fallback filtering when agent fails"""
+    import re
+    
+    filtered_df = df.copy()
+    query_lower = query.lower()
+    
+    # Simple but reliable filtering logic
+    for col in df.columns:
+        col_lower = col.lower()
+        dtype = str(df[col].dtype)
+        
+        if col_lower in query_lower:
+            if 'int' in dtype or 'float' in dtype:
+                # Numeric filtering
+                if '>' in query or 'above' in query_lower:
+                    match = re.search(rf'{col_lower}\s*(?:>|above|greater than|over)\s*([\d.]+)', query_lower)
+                    if match:
+                        value = float(match.group(1))
+                        filtered_df = filtered_df[filtered_df[col] > value]
+                
+                elif '<' in query or 'below' in query_lower:
+                    match = re.search(rf'{col_lower}\s*(?:<|below|less than|under)\s*([\d.]+)', query_lower)
+                    if match:
+                        value = float(match.group(1))
+                        filtered_df = filtered_df[filtered_df[col] < value]
+            
+            elif 'object' in dtype:
+                # String filtering with typo tolerance
+                if 'female' in query_lower and 'gender' in col_lower():
+                    filtered_df = filtered_df[filtered_df[col].str.contains('female', case=False, na=False)]
+                elif 'male' in query_lower and 'gender' in col_lower():
+                    filtered_df = filtered_df[filtered_df[col].str.contains('male', case=False, na=False)]
+    
+    return filtered_df
+
+def classify_query_intent(query):
+    """Router: Classify user intent to determine processing method"""
+    query_lower = query.lower()
+    
+    # Case 1: Filtering/Math - Hard Data
+    filtering_keywords = [
+        '>', '<', '=', 'above', 'below', 'over', 'under', 'greater than', 'less than',
+        'older than', 'younger than', 'higher than', 'lower than',
+        'top', 'bottom', 'first', 'last', 'limit', 'maximum', 'minimum',
+        'between', 'range', 'equals', 'is', 'are'
+    ]
+    
+    # Check for numeric filtering patterns
+    import re
+    numeric_patterns = [
+        r'\d+\s*(?:>|<|=)',
+        r'(?:above|below|over|under|greater|less)\s+\d+',
+        r'(?:older|younger|higher|lower)\s+than\s+\d+',
+        r'top\s+\d+',
+        r'between\s+\d+\s+and\s+\d+'
+    ]
+    
+    has_numeric_filter = any(keyword in query_lower for keyword in filtering_keywords) or \
+                       any(re.search(pattern, query_lower) for pattern in numeric_patterns)
+    
+    # Case 2: Semantic Search - Soft Data
+    semantic_keywords = [
+        'felt', 'happy', 'sad', 'satisfied', 'angry', 'complained', 'experienced',
+        'symptoms', 'description', 'notes', 'feedback', 'comments', 'summary',
+        'similar', 'like', 'related', 'about', 'describe'
+    ]
+    
+    has_semantic_need = any(keyword in query_lower for keyword in semantic_keywords)
+    
+    # Case 3: Hybrid - Both hard and soft
+    if has_numeric_filter and has_semantic_need:
+        return "hybrid"
+    elif has_numeric_filter:
+        return "filtering_math"
+    elif has_semantic_need:
+        return "semantic_search"
+    else:
+        return "general"
+
+def create_dynamic_system_prompt(df, schema):
+    """Create dynamic system prompt with actual data structure"""
+    columns_info = []
+    for col, dtype in schema.items():
+        columns_info.append(f"  - {col} ({dtype})")
+    
+    columns_list = ", ".join(df.columns.tolist())
+    
+    system_prompt = f"""
+You are a data analyst assistant. You have access to a pandas DataFrame with the following structure:
+
+Table Name: df
+Columns:
+{chr(10).join(columns_info)}
+
+Available columns: {columns_list}
+
+Data types are automatically detected. Use this information to:
+1. Write precise filtering conditions for numeric columns (use >, <, ==, >=, <=)
+2. Use exact string matching for categorical columns
+3. Handle mathematical operations correctly (e.g., "above 60" means > 60)
+4. Do not guess column names - use only the columns listed above
+
+Examples:
+- For "Age above 60": df[df['Age'] > 60]
+- For "Gender is Female": df[df['Gender'] == 'Female']
+- For "Sales > 500": df[df['Sales'] > 500]
+- For "Top 10 by Revenue": df.nlargest(10, 'Revenue')
+
+Always return valid pandas code that can be executed.
+"""
+    return system_prompt
+
+def apply_pandas_agent_filtering(df, query, system_prompt):
+    """Apply filtering using Pandas Agent approach"""
+    try:
+        # Try to use LangChain Pandas Agent if available
+        try:
+            from langchain.agents import create_pandas_dataframe_agent
+            from langchain.llms import OpenAI
+            
+            # Create agent with dynamic schema awareness
+            agent = create_pandas_dataframe_agent(
+                llm=None,  # We'll implement our own logic since we don't have OpenAI key
+                df=df,
+                verbose=False,
+                allow_dangerous_code=True
+            )
+            
+            # For now, implement our own agent logic
+            return apply_agent_logic(df, query, system_prompt)
+            
+        except ImportError:
+            # Fallback to our own agent implementation
+            return apply_agent_logic(df, query, system_prompt)
+            
+    except Exception as e:
+        st.warning(f"Agent approach failed: {e}. Using fallback filtering.")
+        return apply_agent_logic(df, query, system_prompt)
+
+def apply_agent_logic(df, query, system_prompt):
+    """Custom agent logic that understands data structure"""
+    import re
+    import pandas as pd
+    
+    filtered_df = df.copy()
+    query_lower = query.lower()
+    
+    # Agent knows the exact columns and types from system prompt
+    for col in df.columns:
+        col_lower = col.lower()
+        dtype = str(df[col].dtype)
+        
+        if col_lower in query_lower:
+            # Numeric columns - Agent understands mathematical operations
+            if 'int' in dtype or 'float' in dtype:
+                # Greater than
+                gt_match = re.search(rf'{col_lower}\s*(?:>|greater than|above|over|older than|higher than)\s*([\d.]+)', query_lower)
+                if gt_match:
+                    value = float(gt_match.group(1))
+                    filtered_df = filtered_df[filtered_df[col] > value]
+                    st.info(f"🤖 Agent: {col} > {value}")
+                
+                # Less than
+                lt_match = re.search(rf'{col_lower}\s*(?:<|less than|below|under|younger than|lower than)\s*([\d.]+)', query_lower)
+                if lt_match:
+                    value = float(lt_match.group(1))
+                    filtered_df = filtered_df[filtered_df[col] < value]
+                    st.info(f"🤖 Agent: {col} < {value}")
+                
+                # Equals
+                eq_match = re.search(rf'{col_lower}\s*(?:=|equals?|is)\s*([\d.]+)', query_lower)
+                if eq_match:
+                    value = float(eq_match.group(1))
+                    filtered_df = filtered_df[filtered_df[col] == value]
+                    st.info(f"🤖 Agent: {col} = {value}")
+            
+            # String columns - Agent uses exact matching
+            elif 'object' in dtype:
+                # Gender
+                if 'female' in query_lower and 'gender' in col_lower:
+                    filtered_df = filtered_df[filtered_df[col] == 'Female']
+                    st.info(f"🤖 Agent: {col} = Female")
+                elif 'male' in query_lower and 'gender' in col_lower:
+                    filtered_df = filtered_df[filtered_df[col] == 'Male']
+                    st.info(f"🤖 Agent: {col} = Male")
+                
+                # General string matching
+                else:
+                    # Look for exact values in query that match column data
+                    unique_values = [str(val).lower() for val in df[col].unique() if pd.notna(val)]
+                    for val in unique_values:
+                        if val in query_lower:
+                            filtered_df = filtered_df[filtered_df[col].str.contains(val, case=False, na=False)]
+                            st.info(f"🤖 Agent: {col} contains '{val}'")
+                            break
+    
+    return filtered_df
+
+def extract_filters_with_llm(query, schema):
+    """Extract filters into JSON format using LLM-like parsing"""
+    import re
+    import json
+    
+    filters = {}
+    query_lower = query.lower()
+    
+    # Enhanced pattern matching for filter extraction
+    for col, dtype in schema.items():
+        col_lower = col.lower()
+        
+        if col_lower in query_lower:
+            # Numeric filters
+            if 'int' in dtype or 'float' in dtype:
+                # Greater than patterns
+                gt_patterns = [
+                    rf'{col_lower}\s*(?:>|greater than|above|over)\s*([\d.]+)',
+                    rf'(?:age|stay|length|duration)\s*(?:>|above|over|greater than)\s*([\d.]+)'
+                ]
+                for pattern in gt_patterns:
+                    match = re.search(pattern, query_lower)
+                    if match:
+                        filters[f"{col_lower}_min"] = float(match.group(1))
+                        break
+                
+                # Less than patterns
+                lt_patterns = [
+                    rf'{col_lower}\s*(?:<|less than|below|under)\s*([\d.]+)',
+                    rf'(?:age|stay|length|duration)\s*(?:<|below|under|less than)\s*([\d.]+)'
+                ]
+                for pattern in lt_patterns:
+                    match = re.search(pattern, query_lower)
+                    if match:
+                        filters[f"{col_lower}_max"] = float(match.group(1))
+                        break
+                
+                # Equal patterns
+                eq_pattern = rf'{col_lower}\s*(?:=|equals?|is)\s*([\d.]+)'
+                match = re.search(eq_pattern, query_lower)
+                if match:
+                    filters[col_lower] = float(match.group(1))
+            
+            # String filters
+            elif 'object' in dtype or 'str' in dtype:
+                # Gender patterns
+                if 'female' in query_lower and 'gender' in col_lower:
+                    filters['gender'] = 'Female'
+                elif 'male' in query_lower and 'gender' in col_lower:
+                    filters['gender'] = 'Male'
+                
+                # Medical conditions
+                elif 'stroke' in query_lower and any(term in col_lower for term in ["diagnosis", "condition", "disease"]):
+                    filters['diagnosis_contains'] = 'stroke'
+                
+                # Plant/Location patterns
+                elif 'plant' in query_lower and any(term in col_lower for term in ["plant", "location", "facility"]):
+                    plant_match = re.search(r'plant\s+(\w+)', query_lower)
+                    if plant_match:
+                        filters['plant'] = plant_match.group(1).capitalize()
+                
+                # General string matching
+                else:
+                    # Extract exact values from query
+                    words = query_lower.split()
+                    for word in words:
+                        if word.capitalize() in [str(v).capitalize() for v in df[col].unique() if pd.notna(v)]:
+                            filters[col_lower] = word.capitalize()
+                            break
+    
+    return filters
+
+def extract_filters_aggressive(query, schema):
+    """More aggressive filter extraction for retry scenarios"""
+    import re
+    
+    filters = {}
+    query_lower = query.lower()
+    
+    # Look for any numbers in the query and associate with nearest column
+    numbers = re.findall(r'\d+\.?\d*', query)
+    
+    # Age patterns
+    if 'age' in query_lower:
+        for num in numbers:
+            if 'above' in query_lower or 'over' in query_lower or '>' in query:
+                filters['age_min'] = float(num)
+            elif 'below' in query_lower or 'under' in query_lower or '<' in query:
+                filters['age_max'] = float(num)
+            else:
+                filters['age'] = float(num)
+    
+    # Gender patterns
+    if 'female' in query_lower:
+        filters['gender'] = 'Female'
+    elif 'male' in query_lower:
+        filters['gender'] = 'Male'
+    
+    # Plant patterns
+    plant_match = re.search(r'plant\s+(\w+)', query_lower)
+    if plant_match:
+        filters['plant'] = plant_match.group(1).capitalize()
+    
+    return filters
+
+def has_specific_conditions(query):
+    """Check if query contains specific conditions that should generate WHERE clauses"""
+    specific_keywords = [
+        '>', '<', '=', 'above', 'below', 'over', 'under', 'greater than', 'less than',
+        'female', 'male', 'plant', 'stroke', 'age', 'stay', 'top', 'limit'
+    ]
+    query_lower = query.lower()
+    return any(keyword in query_lower for keyword in specific_keywords)
+
+def needs_semantic_search(query):
+    """Determine if query needs semantic search for qualitative matching"""
+    semantic_keywords = [
+        'felt', 'happy', 'sad', 'satisfied', 'complained', 'experienced',
+        'symptoms', 'description', 'notes', 'feedback', 'comments'
+    ]
+    query_lower = query.lower()
+    return any(keyword in query_lower for keyword in semantic_keywords)
+
+def apply_hard_filters_sql(conn, table_name, filters, schema):
+    """Apply extracted filters using SQL WHERE clauses"""
+    import pandas as pd
+    
+    conditions = []
+    
+    for filter_key, filter_value in filters.items():
+        # Handle min/max filters
+        if filter_key.endswith('_min'):
+            col = filter_key.replace('_min', '')
+            if col in schema:
+                conditions.append(f'"{col}" > {filter_value}')
+        elif filter_key.endswith('_max'):
+            col = filter_key.replace('_max', '')
+            if col in schema:
+                conditions.append(f'"{col}" < {filter_value}')
+        # Handle contains filters
+        elif filter_key.endswith('_contains'):
+            col = filter_key.replace('_contains', '')
+            if col in schema:
+                conditions.append(f'"{col}" LIKE \'%{filter_value}%\'')
+        # Handle exact match filters
+        elif filter_key in schema:
+            if isinstance(filter_value, str):
+                conditions.append(f'"{filter_key}" = \'{filter_value}\'')
+            else:
+                conditions.append(f'"{filter_key}" = {filter_value}')
+    
+    # Build SQL query
+    sql_query = f"SELECT * FROM {table_name}"
+    if conditions:
+        sql_query += " WHERE " + " AND ".join(conditions)
+        st.info(f"🛡️ SQL WHERE clause: " + " AND ".join(conditions))
+    
+    return pd.read_sql(sql_query, conn)
+
+def apply_hard_filters_pandas(df, filters, schema):
+    """Apply extracted filters using Pandas operations"""
+    filtered_df = df.copy()
+    
+    for filter_key, filter_value in filters.items():
+        # Handle min/max filters
+        if filter_key.endswith('_min'):
+            col = filter_key.replace('_min', '')
+            if col in df.columns:
+                filtered_df = filtered_df[filtered_df[col] > filter_value]
+        elif filter_key.endswith('_max'):
+            col = filter_key.replace('_max', '')
+            if col in df.columns:
+                filtered_df = filtered_df[filtered_df[col] < filter_value]
+        # Handle contains filters
+        elif filter_key.endswith('_contains'):
+            col = filter_key.replace('_contains', '')
+            if col in df.columns:
+                filtered_df = filtered_df[filtered_df[col].str.contains(str(filter_value), case=False, na=False)]
+        # Handle exact match filters
+        elif filter_key in df.columns:
+            if isinstance(filter_value, str):
+                filtered_df = filtered_df[filtered_df[filter_key] == filter_value]
+            else:
+                filtered_df = filtered_df[filtered_df[filter_key] == filter_value]
+    
+    return filtered_df
 
 def apply_sql_filter(conn, table_name, query, schema):
-    """Apply advanced SQL filtering using natural language processing"""
+    """Apply enhanced SQL filtering with proper Text-to-SQL conversion"""
     import pandas as pd
     import re
     
     query_lower = query.lower()
     
-    # Build SQL query based on natural language
-    sql_query = f"SELECT * FROM {table_name}"
-    conditions = []
-    order_by = None
-    limit = None
-    
-    # Enhanced natural language processing
-    for col, dtype in schema.items():
-        col_lower = col.lower()
+    # Enhanced Text-to-SQL prompt engineering
+    def build_sql_from_natural_language(query, schema):
+        """Convert natural language to valid SQL WHERE clauses"""
+        conditions = []
+        order_by = None
+        limit = None
         
-        if col_lower in query_lower:
-            # Handle numeric comparisons
-            if 'int' in dtype or 'float' in dtype:
-                # Greater than
-                if ">" in query:
-                    parts = query.split(">")
-                    if len(parts) == 2 and col_lower in parts[0].lower():
-                        try:
-                            value = float(parts[1].strip())
-                            conditions.append(f'"{col}" > {value}')
-                            st.info(f"🔍 Applied filter: {col} > {value}")
-                        except:
-                            pass
-                
-                # Less than
-                elif "<" in query:
-                    parts = query.split("<")
-                    if len(parts) == 2 and col_lower in parts[0].lower():
-                        try:
-                            value = float(parts[1].strip())
-                            conditions.append(f'"{col}" < {value}')
-                            st.info(f"🔍 Applied filter: {col} < {value}")
-                        except:
-                            pass
-                
-                # Above/Below patterns
-                elif "above" in query_lower or "over" in query_lower:
-                    match = re.search(rf'{col_lower}\s+(?:above|over)\s+([\d.]+)', query_lower)
-                    if match:
-                        value = float(match.group(1))
-                        conditions.append(f'"{col}" > {value}')
-                        st.info(f"🔍 Applied filter: {col} > {value}")
-                
-                elif "below" in query_lower or "under" in query_lower:
-                    match = re.search(rf'{col_lower}\s+(?:below|under)\s+([\d.]+)', query_lower)
-                    if match:
-                        value = float(match.group(1))
-                        conditions.append(f'"{col}" < {value}')
-                        st.info(f"🔍 Applied filter: {col} < {value}")
-                
-                # Age patterns (e.g., "above 60")
-                elif "age" in col_lower and ("above" in query_lower or "over" in query_lower):
-                    match = re.search(r'(?:above|over)\s+(\d+)', query_lower)
-                    if match:
-                        value = float(match.group(1))
-                        conditions.append(f'"{col}" > {value}')
-                        st.info(f"🔍 Applied filter: {col} > {value}")
+        # Enhanced pattern matching with column type awareness
+        for col, dtype in schema.items():
+            col_lower = col.lower()
             
-            # Handle categorical/string columns
-            elif 'object' in dtype or 'str' in dtype:
-                # Gender patterns
-                if "female" in query_lower and "gender" in col_lower:
-                    conditions.append(f'"{col}" = \'Female\'')
-                    st.info(f"🔍 Applied filter: {col} = Female")
-                elif "male" in query_lower and "gender" in col_lower:
-                    conditions.append(f'"{col}" = \'Male\'')
-                    st.info(f"🔍 Applied filter: {col} = Male")
+            if col_lower in query_lower:
+                # Numeric columns - support mathematical operators
+                if 'int' in dtype or 'float' in dtype:
+                    # Greater than patterns
+                    gt_match = re.search(rf'{col_lower}\s*(?:>|greater than|above|over)\s*([\d.]+)', query_lower)
+                    if gt_match:
+                        value = float(gt_match.group(1))
+                        conditions.append(f'"{col}" > {value}')
+                        st.info(f"� Applied filter: {col} > {value}")
+                    
+                    # Less than patterns
+                    lt_match = re.search(rf'{col_lower}\s*(?:<|less than|below|under)\s*([\d.]+)', query_lower)
+                    if lt_match:
+                        value = float(lt_match.group(1))
+                        conditions.append(f'"{col}" < {value}')
+                        st.info(f"� Applied filter: {col} < {value}")
+                    
+                    # Equal patterns
+                    eq_match = re.search(rf'{col_lower}\s*(?:=|equals?|is)\s*([\d.]+)', query_lower)
+                    if eq_match:
+                        value = float(eq_match.group(1))
+                        conditions.append(f'"{col}" = {value}')
+                        st.info(f"� Applied filter: {col} = {value}")
+                    
+                    # Age-specific patterns
+                    if 'age' in col_lower:
+                        age_gt = re.search(r'(?:age|ages?)\s*(?:>|above|over|greater than)\s*(\d+)', query_lower)
+                        if age_gt:
+                            value = float(age_gt.group(1))
+                            conditions.append(f'"{col}" > {value}')
+                            st.info(f"� Applied filter: {col} > {value}")
+                        
+                        age_lt = re.search(r'(?:age|ages?)\s*(?:<|below|under|less than)\s*(\d+)', query_lower)
+                        if age_lt:
+                            value = float(age_lt.group(1))
+                            conditions.append(f'"{col}" < {value}')
+                            st.info(f"� Applied filter: {col} < {value}")
                 
-                # Medical conditions
-                elif "stroke" in query_lower and any(term in col_lower for term in ["diagnosis", "condition", "disease"]):
-                    conditions.append(f'"{col}" LIKE \'%stroke%\'')
-                    st.info(f"🔍 Applied filter: {col} contains 'stroke'")
-                
-                # Plant/Location patterns
-                elif "plant" in query_lower and any(term in col_lower for term in ["plant", "location", "facility"]):
-                    match = re.search(r'plant\s+(\w+)', query_lower)
-                    if match:
-                        plant = match.group(1).capitalize()
-                        conditions.append(f'"{col}" = \'{plant}\'')
-                        st.info(f"🔍 Applied filter: {col} = {plant}")
-                
-                # General equality patterns
-                elif "=" in query or "is" in query_lower or "==" in query:
-                    # Get distinct values to match against
-                    try:
-                        distinct_vals = pd.read_sql(f'SELECT DISTINCT "{col}" FROM {table_name}', conn)[col].unique()
-                        for val in distinct_vals:
-                            if str(val).lower() in query_lower:
-                                conditions.append(f'"{col}" = \'{val}\'')
-                                st.info(f"🔍 Applied filter: {col} = {val}")
-                                break
-                    except:
-                        pass
-    
-    # Handle ranking/sorting patterns
-    if "top" in query_lower or "highest" in query_lower or "largest" in query_lower:
-        # Find numeric columns for ranking
-        numeric_cols = [col for col, dtype in schema.items() if 'int' in dtype or 'float' in dtype]
+                # String columns - support exact matching and LIKE
+                elif 'object' in dtype or 'str' in dtype:
+                    # Gender patterns
+                    if 'female' in query_lower and 'gender' in col_lower:
+                        conditions.append(f'"{col}" = \'Female\'')
+                        st.info(f"� Applied filter: {col} = Female")
+                    elif 'male' in query_lower and 'gender' in col_lower:
+                        conditions.append(f'"{col}" = \'Male\'')
+                        st.info(f"� Applied filter: {col} = Male")
+                    
+                    # Medical conditions
+                    elif 'stroke' in query_lower and any(term in col_lower for term in ["diagnosis", "condition", "disease"]):
+                        conditions.append(f'"{col}" LIKE \'%stroke%\'')
+                        st.info(f"� Applied filter: {col} contains 'stroke'")
+                    
+                    # Plant/Location patterns
+                    elif 'plant' in query_lower and any(term in col_lower for term in ["plant", "location", "facility"]):
+                        plant_match = re.search(r'plant\s+(\w+)', query_lower)
+                        if plant_match:
+                            plant = plant_match.group(1).capitalize()
+                            conditions.append(f'"{col}" = \'{plant}\'')
+                            st.info(f"� Applied filter: {col} = {plant}")
+                    
+                    # General exact matching
+                    else:
+                        # Get distinct values for exact matching
+                        try:
+                            distinct_vals = pd.read_sql(f'SELECT DISTINCT "{col}" FROM {table_name}', conn)[col].unique()
+                            for val in distinct_vals:
+                                if str(val).lower() in query_lower:
+                                    conditions.append(f'"{col}" = \'{val}\'')
+                                    st.info(f"� Applied filter: {col} = {val}")
+                                    break
+                        except:
+                            pass
         
-        # Revenue/sales patterns
-        revenue_col = next((col for col in numeric_cols if any(term in col.lower() for term in ["revenue", "sales", "amount", "value"])), None)
-        if revenue_col and ("revenue" in query_lower or "sales" in query_lower):
-            order_by = f'"{revenue_col}" DESC'
-            st.info(f"🔍 Ordering by: {revenue_col} (descending)")
-        elif numeric_cols:
-            # Default to first numeric column
-            order_by = f'"{numeric_cols[0]}" DESC'
-            st.info(f"🔍 Ordering by: {numeric_cols[0]} (descending)")
+        # Handle ranking and ordering
+        if any(keyword in query_lower for keyword in ["top", "highest", "largest", "best"]):
+            numeric_cols = [col for col, dtype in schema.items() if 'int' in dtype or 'float' in dtype]
+            
+            # Smart column detection for ranking
+            revenue_col = next((col for col in numeric_cols if any(term in col.lower() for term in ["revenue", "sales", "amount", "value", "cost", "price"])), None)
+            if revenue_col:
+                order_by = f'"{revenue_col}" DESC'
+                st.info(f"� Ordering by: {revenue_col} (descending)")
+            elif numeric_cols:
+                order_by = f'"{numeric_cols[0]}" DESC'
+                st.info(f"� Ordering by: {numeric_cols[0]} (descending)")
+            
+            # Extract limit
+            top_match = re.search(r'top\s+(\d+)', query_lower)
+            if top_match:
+                limit = int(top_match.group(1))
+                st.info(f"🔧 Limiting to: Top {limit} results")
         
-        # Extract limit for top N
-        match = re.search(r'top\s+(\d+)', query_lower)
-        if match:
-            limit = int(match.group(1))
-            st.info(f"🔍 Limiting to: Top {limit} results")
+        return conditions, order_by, limit
     
-    # Add conditions to SQL query
+    # Build SQL query
+    conditions, order_by, limit = build_sql_from_natural_language(query, schema)
+    
+    sql_query = f"SELECT * FROM {table_name}"
+    
+    # Add WHERE conditions (HARD FILTERING)
     if conditions:
         sql_query += " WHERE " + " AND ".join(conditions)
+        st.success(f"🛡️ Applied {len(conditions)} hard filters for precise results")
     
     # Add ordering
     if order_by:
