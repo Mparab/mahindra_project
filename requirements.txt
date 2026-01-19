@@ -4,6 +4,5 @@ langchain-openai
 langchain-experimental
 openpyxl
 tabulate
-# Note: Docling is heavy. If the deploy fails on free tier, 
-# switch to 'pypdf' and 'python-docx' instead.
-docling
+pdfplumber
+python-docx

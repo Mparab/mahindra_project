@@ -3,7 +3,8 @@ import pandas as pd
 import os
 from langchain_openai import ChatOpenAI
 from langchain_experimental.agents import create_pandas_dataframe_agent
-from docling.document_converter import DocumentConverter
+import pdfplumber # Lite PDF tool
+from docx import Document # Lite Word tool
 import tempfile
 
 # --- 1. PAGE CONFIGURATION ---
@@ -26,11 +27,11 @@ st.markdown("""
 # --- 3. HELPER FUNCTIONS ---
 @st.cache_data
 def load_data(uploaded_file):
-    """Universal File Loader"""
+    """Lite File Loader (Uses pdfplumber/python-docx instead of Docling)"""
     try:
         file_name = uploaded_file.name.lower()
         
-        # CSV Handling
+        # CSV
         if file_name.endswith('.csv'):
             try:
                 return pd.read_csv(uploaded_file)
@@ -38,24 +39,38 @@ def load_data(uploaded_file):
                 uploaded_file.seek(0)
                 return pd.read_csv(uploaded_file, encoding='ISO-8859-1')
         
-        # Excel Handling
+        # Excel
         elif file_name.endswith(('.xls', '.xlsx')):
             return pd.read_excel(uploaded_file)
             
-        # PDF/Docx Handling
-        elif file_name.endswith(('.pdf', '.docx', '.pptx', '.html')):
-            with st.spinner("📄 Extracting data from document..."):
-                import tempfile
-                with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_name.split('.')[-1]}") as tmp:
-                    tmp.write(uploaded_file.getvalue())
-                    tmp_path = tmp.name
-                
-                converter = DocumentConverter()
-                result = converter.convert(tmp_path)
-                tables = [t.export_to_dataframe() for t in result.document.tables]
+        # PDF (Lite Version)
+        elif file_name.endswith('.pdf'):
+            with st.spinner("📄 Extracting tables from PDF..."):
+                tables = []
+                with pdfplumber.open(uploaded_file) as pdf:
+                    for page in pdf.pages:
+                        extracted = page.extract_table()
+                        if extracted:
+                            # Convert list of lists to DataFrame
+                            df = pd.DataFrame(extracted[1:], columns=extracted[0])
+                            tables.append(df)
                 
                 if not tables: return None
-                return max(tables, key=len) # Return largest table
+                return max(tables, key=len) # Largest table
+
+        # Word (Lite Version)
+        elif file_name.endswith('.docx'):
+            with st.spinner("📄 Extracting tables from Word..."):
+                doc = Document(uploaded_file)
+                tables = []
+                for table in doc.tables:
+                    data = [[cell.text for cell in row.cells] for row in table.rows]
+                    if data:
+                        df = pd.DataFrame(data[1:], columns=data[0])
+                        tables.append(df)
+                
+                if not tables: return None
+                return max(tables, key=len)
         else:
             return None
     except Exception as e:
